@@ -45,7 +45,7 @@
     "rate-limit-redis": "^4.2.0",
     "sharp": "^0.35.5",
     "socks-proxy-agent": "^8.0.5",
-    "zod": "^3.25.0"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
