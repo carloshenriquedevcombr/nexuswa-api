@@ -1,0 +1,14 @@
+# Teste no PC (Docker Desktop). Portas publicadas APENAS em 127.0.0.1.
+# 5433/6380 para não conflitar com o seu postgres_dev (5432).
+#   docker compose -f docker-compose.yml -f docker-compose.pc.yml up -d --build
+services:
+  postgres:
+    ports: ["127.0.0.1:5433:5432"]
+  redis:
+    ports: ["127.0.0.1:6380:6379"]
+  api:
+    environment:
+      NODE_ENV: development
+      PUBLIC_URL: http://localhost:3000
+      COOKIE_SECURE: "false"
+    ports: ["127.0.0.1:3000:3000"]

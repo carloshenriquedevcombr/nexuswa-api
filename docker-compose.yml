@@ -1,0 +1,80 @@
+# NexusWA — stack base (PC e VPS). Use junto com docker-compose.pc.yml OU docker-compose.vps.yml.
+# Segurança: Postgres e Redis ficam SOMENTE na rede interna (sem porta pública).
+name: nexuswa
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: nexuswa_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nexuswa}
+      POSTGRES_USER: ${POSTGRES_USER:-nexuswa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexuswa_redis
+    restart: unless-stopped
+    # noeviction: exigido pelo BullMQ (filas não podem perder jobs por falta de memória)
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}
+      --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+      --rename-command FLUSHALL "" --rename-command FLUSHDB ""
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} --no-auth-warning ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  api:
+    build: .
+    image: nexuswa-api:latest
+    container_name: nexuswa_api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nexuswa}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nexuswa}?schema=public
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      MEDIA_DIR: /app/storage/media
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - media:/app/storage/media
+    # Hardening: filesystem somente leitura, sem capabilities Linux, sem escalar privilégio.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+    networks: [internal]
+
+volumes:
+  pgdata:
+  redisdata:
+  media:
+
+networks:
+  internal:
+    driver: bridge

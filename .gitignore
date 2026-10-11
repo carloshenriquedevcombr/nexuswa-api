@@ -1,0 +1,38 @@
+# Dependências e build
+node_modules/
+dist/
+coverage/
+
+# Segredos — NUNCA versionar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Sessões/mídias locais (credenciais WhatsApp e arquivos de usuários)
+auth_info*/
+storage/
+backups/
+
+# Ferramentas
+.DS_Store
+Thumbs.db
+*.log
+.vscode/*
+!.vscode/extensions.json
+
+# --- nunca subir ---
+node_modules/
+.next/
+dist/
+backups/
+*.tar.gz
+.env
+.env.*
+!.env.example
+creds.json
+pre-key-*.json
+session-*.json
+sender-key-*.json
+app-state-sync-*.json

@@ -1,0 +1,486 @@
+// NexusWA — modelo de dados.
+// Regras de isolamento: toda tabela de domínio WhatsApp carrega instanceId e toda
+// query da aplicação filtra por ele (o instanceId vem SEMPRE da credencial validada,
+// nunca do corpo da requisição). Instâncias pertencem a um User (tenant).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ================= IDENTIDADE / TENANCY =================
+enum Role {
+  admin
+  client
+  agent // atendente: só responde as conversas distribuídas a ele
+}
+
+model User {
+  id               String    @id @default(uuid())
+  email            String    @unique
+  name             String    @default("")
+  passwordHash     String // argon2id
+  role             Role      @default(client)
+  isActive         Boolean   @default(true)
+  maxInstances     Int       @default(1)
+  totpSecretEnc    String? // AES-256-GCM
+  totpEnabled      Boolean   @default(false)
+  failedLogins     Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  passwordChangedAt DateTime @default(now())
+  // Atendentes pertencem ao cliente que os cadastrou (só ele e o admin os gerenciam).
+  ownerUserId      String?
+  ownerUser        User?     @relation("AgentOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  agents           User[]    @relation("AgentOwner")
+  agentLinks       InstanceAgent[]
+  webhooks         UserWebhook[]
+
+  instances     Instance[]
+  refreshTokens RefreshToken[]
+  bugReports    BugReport[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerUserId])
+  @@map("users")
+}
+
+// Vínculo atendente ↔ número (instância). Um atendente pode atender vários números
+// do mesmo dono; status/pausa valem por número.
+model InstanceAgent {
+  id             String    @id @default(uuid())
+  instanceId     String
+  instance       Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  active         Boolean   @default(true) // o dono liga/desliga o atendente neste número
+  status         String    @default("available") // available | paused
+  pauseReason    String    @default("") // almoco | ferias | outro
+  pausedUntil    DateTime? // volta sozinho depois desta data (ex.: fim das férias)
+  breakStart     String    @default("") // "12:00" — pausa diária automática (almoço)
+  breakEnd       String    @default("") // "13:00"
+  lastAssignedAt DateTime? // rodízio: quem recebeu há mais tempo recebe o próximo
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([instanceId, userId])
+  @@index([userId])
+  @@map("instance_agents")
+}
+
+// Listas de conversas do painel (como as "Listas" do WhatsApp). "favoritas" é embutida.
+model ChatList {
+  id         String   @id @default(uuid())
+  instanceId String
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  name       String
+  createdAt  DateTime @default(now())
+
+  @@index([instanceId])
+  @@map("chat_lists")
+}
+
+// Voto atual de cada pessoa em cada enquete (o WhatsApp manda só o voto de quem mudou;
+// a contagem é refeita a partir desta tabela, então nenhum voto anterior se perde).
+model PollVote {
+  id         String   @id @default(uuid())
+  instanceId String
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  pollId     String // id da linha da enquete em messages
+  voter      String // JID de quem votou (número quando conhecido)
+  options    String[] @default([])
+  updatedAt  DateTime @updatedAt
+
+  @@unique([instanceId, pollId, voter])
+  @@index([instanceId, pollId])
+  @@map("poll_votes")
+}
+
+// Webhook da CONTA: recebe eventos de todas as instâncias do usuário.
+model UserWebhook {
+  id                  String   @id @default(uuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url                 String
+  enabled             Boolean  @default(true)
+  events              String[] @default([])
+  excludeMessages     String[] @default([])
+  onlyChats           String[] @default([])
+  addUrlEvents        Boolean  @default(false)
+  addUrlTypesMessages Boolean  @default(false)
+  secretEnc           String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([userId])
+  @@map("user_webhooks")
+}
+
+// Refresh token opaco, guardado apenas como hash. familyId permite detectar
+// reuso (token roubado): se um token já rotacionado reaparecer, a família inteira é revogada.
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  familyId   String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+  userAgent  String    @default("")
+  ip         String    @default("")
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorType  String // user | admintoken | instance | system
+  actorId    String   @default("")
+  action     String
+  targetType String   @default("")
+  targetId   String   @default("")
+  ip         String   @default("")
+  requestId  String   @default("")
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorType, actorId])
+  @@map("audit_logs")
+}
+
+model BugReport {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  instanceId  String?
+  title       String
+  description String
+  severity    String   @default("medium") // low | medium | high | critical
+  status      String   @default("open") // open | triaged | fixed | wontfix
+  context     Json?
+  requestId   String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@map("bug_reports")
+}
+
+// ================= INSTÂNCIAS =================
+model Instance {
+  id                   String    @id @default(uuid())
+  ownerId              String?
+  owner                User?     @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  agents               InstanceAgent[]
+  chatLists            ChatList[]
+  pollVotes            PollVote[]
+  name                 String
+  systemName           String    @default("")
+  tokenHash            String    @unique // SHA-256 do token; o token em claro só é exibido na criação/rotação
+  tokenPrefix          String    @default("")
+  status               String    @default("disconnected") // disconnected | connecting | connected | hibernated
+  qrcode               String    @default("")
+  paircode             String    @default("")
+  connectedPhone       String    @default("")
+  ownerJid             String    @default("")
+  profileName          String    @default("")
+  profilePicUrl        String    @default("")
+  isBusiness           Boolean   @default(false)
+  platform             String    @default("")
+  currentPresence      String    @default("available")
+  lastDisconnect       DateTime?
+  lastDisconnectReason String    @default("")
+  pairedAt             DateTime?
+
+  adminField01         String    @default("")
+  adminField02         String    @default("")
+
+  msgDelayMin          Int       @default(0)
+  msgDelayMax          Int       @default(2)
+  openaiApiKeyEnc      String? // AES-256-GCM
+  proxyUrlEnc          String? // AES-256-GCM
+  fieldsMap            Json?
+
+  authStates           AuthState[]
+  webhooks             Webhook[]
+  chats                Chat[]
+  contacts             Contact[]
+  messages             Message[]
+  labels               Label[]
+  leadTags             LeadTag[]
+  quickReplies         QuickReply[]
+  campaignFolders      CampaignFolder[]
+  campaignMessages     CampaignMessage[]
+
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("instances")
+}
+
+// Credenciais Baileys cifradas (AES-256-GCM). Substituem a pasta auth_info em disco.
+model AuthState {
+  instanceId String
+  key        String
+  value      String   @db.Text
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  updatedAt  DateTime @updatedAt
+
+  @@id([instanceId, key])
+  @@map("auth_states")
+}
+
+// ================= WEBHOOKS =================
+model Webhook {
+  id                  String   @id @default(uuid())
+  instanceId          String
+  instance            Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  url                 String
+  enabled             Boolean  @default(true)
+  events              String[] @default([])
+  excludeMessages     String[] @default([])
+  addUrlEvents        Boolean  @default(false)
+  addUrlTypesMessages Boolean  @default(false)
+  // Filtro opcional: só entrega eventos destes chats (números/grupos). Vazio = todos.
+  onlyChats           String[] @default([])
+  secretEnc           String // segredo HMAC cifrado; usado para assinar cada entrega
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([instanceId])
+  @@map("webhooks")
+}
+
+model GlobalWebhook {
+  id                  String   @id @default("global")
+  url                 String
+  enabled             Boolean  @default(true)
+  events              String[] @default([])
+  excludeMessages     String[] @default([])
+  addUrlEvents        Boolean  @default(false)
+  addUrlTypesMessages Boolean  @default(false)
+  secretEnc           String
+  updatedAt           DateTime @updatedAt
+
+  @@map("global_webhook")
+}
+
+// ================= CHATS / CRM =================
+model Chat {
+  id                      String   @id @default(uuid())
+  instanceId              String
+  instance                Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  chatid                  String
+  chatlid                 String   @default("")
+  name                    String   @default("")
+  contactName             String   @default("")
+  pushName                String   @default("")
+  image                   String   @default("")
+  isGroup                 Boolean  @default(false)
+  isGroupAdmin            Boolean  @default(false)
+  isGroupAnnounce         Boolean  @default(false)
+  isGroupMember           Boolean  @default(true)
+  archived                Boolean  @default(false)
+  pinned                  Boolean  @default(false)
+  blocked                 Boolean  @default(false)
+  muteEndTime             BigInt   @default(0)
+  unreadCount             Int      @default(0)
+  ephemeralExpiration     Int      @default(0)
+  lastMsgTimestamp        BigInt   @default(0)
+  lastMessageType         String   @default("")
+  lastMessageText         String   @default("")
+  lastMessageSender       String   @default("")
+  labels                  String[] @default([])
+  notes                   String   @default("")
+
+  leadName                String   @default("")
+  leadFullName            String   @default("")
+  leadEmail               String   @default("")
+  leadPersonalId          String   @default("")
+  leadStatus              String   @default("")
+  leadNotes               String   @default("")
+  leadTags                String[] @default([])
+  leadIsTicketOpen        Boolean  @default(false)
+  leadAssignedAttendantId String   @default("")
+  // Listas do painel (ids de ChatList + "favoritas") e trava de conversa (só o dono vê, com senha).
+  lists                   String[] @default([])
+  locked                  Boolean  @default(false)
+  leadKanbanOrder         BigInt   @default(0)
+  leadFields              Json?
+  chatbotDisableUntil     BigInt   @default(0)
+
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  @@unique([instanceId, chatid])
+  @@index([instanceId, lastMsgTimestamp])
+  @@index([instanceId, leadStatus])
+  @@index([instanceId, leadAssignedAttendantId])
+  @@index([instanceId, leadIsTicketOpen])
+  @@map("chats")
+}
+
+model Contact {
+  id            String   @id @default(uuid())
+  instanceId    String
+  instance      Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  jid           String
+  lid           String   @default("")
+  fullName      String   @default("")
+  firstName     String   @default("")
+  pushName      String   @default("")
+  businessName  String   @default("")
+  inAddressBook Boolean  @default(false)
+  updatedAt     DateTime @updatedAt
+
+  @@unique([instanceId, jid])
+  @@index([instanceId, inAddressBook])
+  @@map("contacts")
+}
+
+// ================= MENSAGENS (retenção configurável, padrão 7 dias) =================
+model Message {
+  id               String    @id // "<ownerNumber>:<messageid>"
+  instanceId       String
+  instance         Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  messageid        String
+  chatid           String
+  sender           String    @default("")
+  senderName       String    @default("")
+  fromMe           Boolean   @default(false)
+  isGroup          Boolean   @default(false)
+  messageType      String    @default("")
+  source           String    @default("")
+  text             String    @default("")
+  quoted           String    @default("")
+  edited           String    @default("")
+  reaction         String    @default("")
+  vote             String    @default("")
+  status           String    @default("")
+  error            String    @default("")
+  wasSentByApi     Boolean   @default(false)
+  sendFunction     String    @default("")
+  sendFolderId     String    @default("")
+  trackSource      String    @default("")
+  trackId          String    @default("")
+  fileURL          String    @default("")
+  transcription    String    @default("")
+  pinned           Boolean   @default(false)
+  content          Json?
+  messageTimestamp BigInt    @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([instanceId, chatid, messageTimestamp])
+  @@index([instanceId, messageid])
+  @@index([instanceId, trackSource, trackId])
+  @@index([instanceId, status])
+  @@index([createdAt])
+  @@map("messages")
+}
+
+// ================= ETIQUETAS / TAGS / RESPOSTAS =================
+model Label {
+  id         String   @id @default(uuid())
+  instanceId String
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  labelid    String
+  name       String
+  color      Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([instanceId, labelid])
+  @@map("labels")
+}
+
+model LeadTag {
+  id          String   @id @default(uuid())
+  instanceId  String
+  instance    Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  name        String
+  kanban      Boolean  @default(false)
+  kanbanOrder BigInt   @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([instanceId, name])
+  @@map("lead_tags")
+}
+
+model QuickReply {
+  id         String   @id @default(uuid())
+  instanceId String
+  instance   Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  shortCut   String
+  type       String   @default("text")
+  text       String   @default("")
+  file       String   @default("")
+  docName    String   @default("")
+  onWhatsApp Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([instanceId, shortCut])
+  @@map("quick_replies")
+}
+
+// ================= CAMPANHAS (/sender) =================
+model CampaignFolder {
+  id           String   @id @default(uuid())
+  instanceId   String
+  instance     Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  info         String   @default("")
+  status       String   @default("scheduled") // scheduled | sending | paused | done | deleting
+  scheduledFor BigInt   @default(0) // ms Unix
+  nextSendAt   BigInt   @default(0) // ms Unix — ritmo entre mensagens
+  delayMin     Int      @default(10) // segundos
+  delayMax     Int      @default(30)
+  logTotal     Int      @default(0)
+  logSuccess   Int      @default(0)
+  logFailed    Int      @default(0)
+  logDelivered Int      @default(0)
+  logRead      Int      @default(0)
+  logPlayed    Int      @default(0)
+  messages     CampaignMessage[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([instanceId, status])
+  @@index([status, nextSendAt])
+  @@map("campaign_folders")
+}
+
+model CampaignMessage {
+  id         String         @id @default(uuid())
+  instanceId String
+  instance   Instance       @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  folderId   String
+  folder     CampaignFolder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  position   Int            @default(0)
+  number     String
+  type       String
+  payload    Json
+  status     String         @default("Scheduled") // Scheduled | Sending | Sent | Failed
+  error      String         @default("")
+  messageid  String         @default("")
+  sentAt     DateTime?
+  createdAt  DateTime       @default(now())
+
+  @@index([folderId, status, position])
+  @@index([instanceId, messageid])
+  @@map("campaign_messages")
+}
